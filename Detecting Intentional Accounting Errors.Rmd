@@ -1,0 +1,730 @@
+---
+title: "Detecting Intentional Accounting Errors"
+subtitle: "Model"
+author: "Dominic Liman, Wee Kiang, Charlotte Ang"
+date: "`r Sys.Date()`"
+output:
+  tufte::tufte_html: 
+    tufte_variant: "default"
+    self_contained: yes
+---
+
+```{r exercise, eval=TRUE}
+library(tidyverse)
+library(plotly)
+library(reshape2)
+library(dplyr)
+
+# Read all datasets
+training = read.csv("Restate_int_train.csv",stringsAsFactors = FALSE)
+testing = read.csv("Restate_int_test.csv",stringsAsFactors = FALSE)
+
+STD = read.csv("STD.csv", stringsAsFactors = FALSE)
+SUMM_STD = read.csv("SUMM_STD.csv", stringsAsFactors = FALSE)
+
+# Replacing the data in STD with SUMM_STD
+library(rqdatatable)
+combined <- natural_join(SUMM_STD, STD, 
+                      by = c("gvkey","fyear"),
+                      jointype = "FULL")
+
+# Join the 2 datasets
+
+library(plyr)
+names(combined)[2] <- "year"
+
+dfjoined <- join(training, combined, 
+                      by = c("gvkey","year"), type = "left", match = "first")
+testing <- join(testing, combined, 
+                      by = c("gvkey","year"), type = "left", match = "first")
+
+#inspect dataset 
+summary(dfjoined)
+
+```
+
+# Creating new IVs
+
+```{r exercise0, eval=TRUE}
+
+#Calculate additional measures
+dfjoined <- dfjoined %>% 
+  group_by(gvkey) %>%
+  mutate(c_ratio= act/lct,
+         wc_accruals= ((act-lag(act)) - ((lct-lag(lct))-(dlc-lag(dlc))-(txp-lag(txp))))/at, 
+         emp_change = emp-lag(emp), 
+         soft_assets = (at-ppegt-chech)/at, 
+         M2B = mkvalt/seq, 
+         at_gr = (at-lag(at))/lag(at),
+         inventory_ch= invch/at, 
+         receivables_ch = recch/at, 
+         roa= ni/at, 
+         roa_ch= (roa-lag(roa))/lag(roa),
+         earnings_to_price = ni/mkvalt, 
+         earnings_gr = (ebit-lag(ebit))/lag(ebit),
+         cash_profit_margin = oancf/sale, 
+         int_coverage_ratio = ebit/xint) %>% ungroup()
+
+testing <- testing %>% 
+  group_by(gvkey) %>%
+  mutate(c_ratio= act/lct,
+         wc_accruals= ((act-lag(act)) - ((lct-lag(lct))-(dlc-lag(dlc))-(txp-lag(txp))))/at, 
+         emp_change = emp-lag(emp), 
+         soft_assets = (at-ppegt-chech)/at, 
+         M2B = mkvalt/seq, 
+         at_gr = (at-lag(at))/lag(at),
+         inventory_ch= invch/at, 
+         receivables_ch = recch/at, 
+         roa= ni/at, 
+         roa_ch= (roa-lag(roa))/lag(roa),
+         earnings_to_price = ni/mkvalt, 
+         earnings_gr = (ebit-lag(ebit))/lag(ebit),
+         cash_profit_margin = oancf/sale, 
+         int_coverage_ratio = ebit/xint) %>% ungroup()
+
+```
+
+Including the sentiment analysis data
+
+```{r exercise0, eval=TRUE}
+
+# Read all datasets
+sentiment = read.csv("sentiment.csv",stringsAsFactors = FALSE)
+
+sentiment$year = substr(sentiment$FDATE, 1, 4)
+sentiment$year = as.numeric(sentiment$year)
+
+sentiment <- sentiment %>% select(-c(1,2))
+names(sentiment)[1] <- "conm"
+
+dfjoined1 <- join(dfjoined, sentiment, 
+                      by = c("conm","year"), type = "left", match = "first")
+
+
+```
+
+```{r , eval=TRUE}
+
+#replace Inf with NA
+
+is.na(dfjoined1) <- sapply(dfjoined1, is.infinite)
+summary(dfjoined1)
+
+is.na(testing) <- sapply(testing, is.infinite)
+
+# Removing non-numeric columns
+
+dfnumeric <- dfjoined1[,sapply(dfjoined1, is.numeric)]
+str(dfnumeric)
+
+# extracting gvkey with missing values
+
+sum(is.na(dfnumeric))
+dfna = data.frame(which(is.na(dfnumeric), arr.ind=TRUE))
+
+dfna = dfnumeric[rownames(dfnumeric) %in% dfna$row,] 
+
+print(dfna)
+
+```
+
+Removing columns with too much missing values
+
+```{r exercise2, eval=TRUE}
+
+# find percentange of missing values for each column
+
+pMiss <- function(x){sum(is.na(x))/length(x)*100}
+apply(dfnumeric,2,pMiss)
+
+# we will be removing columns with 10% missing values instead so that we can use the same variables to run the models
+
+dfnumeric <- dfnumeric %>% select(-c(5,9,21,23,25,34,38,40,41,44,48,50,52,53,54,55,56,57,58,59,60,61,62))
+
+# pattern of missing data
+library(mice)
+library(VIM)
+aggr_plot <- aggr(dfnumeric, col=c('navyblue','red'), numbers=TRUE, sortVars=TRUE, 
+                  labels=names(dfnumeric), cex.axis=.7, gap=3, ylab=c("Histogram of missing data","Pattern"))
+
+```
+
+None of the sentiment analysis missing values was less than 10% and hence, all were removed.
+
+# Imputation of missing values
+
+https://www.r-bloggers.com/imputing-missing-data-with-r-mice-package/
+
+While some quick fixes such as mean-substitution may be fine in some cases, such simple approaches usually introduce bias into the data, for instance, applying mean substitution leaves the mean unchanged (which is desirable) but decreases variance, which may be undesirable.
+
+The mice package in R, helps you imputing missing values with plausible data values. These plausible values are drawn from a distribution specifically designed for each missing datapoint.
+
+Usually a safe maximum threshold is 5% of the total for large datasets. If missing data for a certain feature or sample is more than 5% then you probably should leave that feature or sample out. We therefore check for features (columns) and samples (rows) where more than 5% of the data is missing using a simple function
+
+
+```{r exercise2, eval=TRUE}
+
+# imputation on the training set
+
+tempData <- mice(dfnumeric,m=5,maxit=50,meth='cart',seed=500)
+summary(tempData)
+
+# replacing the missing values with the imputed values
+
+completedData <- complete(tempData,1)
+
+apply(completedData,2,pMiss)
+
+dfna2 = data.frame(which(is.na(completedData), arr.ind=TRUE))
+
+saveRDS(completedData,"completedData.rds")
+```
+
+
+```{r exercise2, eval=TRUE}
+
+# imputation on the test set 
+
+# Removing non-numeric columns
+
+dftesting <- testing[,sapply(testing, is.numeric)]
+str(dftesting)
+
+# find percentange of missing values for each column
+
+apply(dftesting,2,pMiss)
+
+# we will be removing columns that are not present in the dfnumeric 
+dftesting <- dftesting %>% select(2,1,3,5,6,7,9,10,11,12,13,14,15,16,17,18,19,21,23,25,26,27,
+                                    28,29,30,31,32,34,35,36,38,41,42,44,45,46,48,50)
+
+# pattern of missing data
+aggr_plot <- aggr(dftesting, col=c('navyblue','red'), numbers=TRUE, sortVars=TRUE, 
+                  labels=names(dftesting), cex.axis=.7, gap=3, ylab=c("Histogram of missing data","Pattern"))
+
+# imputation 
+
+tempData2 <- mice(dftesting,m=5,maxit=50,meth='cart',seed=500)
+summary(tempData2)
+
+# replacing the missing values with the imputed values
+
+testingfull <- complete(tempData2,1)
+
+apply(testingfull,2,pMiss)
+
+dfna3 = data.frame(which(is.na(testingfull), arr.ind=TRUE))
+
+saveRDS(testingfull,"testingfull.rds")
+
+```
+
+# Logistic model
+
+```{r exercise3, eval=TRUE, message=FALSE}
+
+#Logistic model 
+library(glmnet)
+library(coefplot)
+library(ROCR)
+
+# Equation for the regression.  -1 removes the intercept
+eq = as.formula("as.factor(Restate_Int) ~ act + at + ch + chech + dclo + dcpstk + dlc + dltt + ebit + 
+                emp + invch + ivch + ivst + lct + mkvalt + ni + oancf + ppegt + re + recch + 
+                revt + sale + seq + txp + xint + c_ratio + soft_assets + M2B + inventory_ch + receivables_ch + 
+                roa + earnings_to_price + cash_profit_margin -1")
+            
+fit1 <- glm(eq, data = completedData, family = "binomial")
+
+# Output a summary of the model
+summary(fit1)
+
+# AUC
+pred1 <- predict(fit1, dfnumeric, type="response") 
+ROCpred_out1 <- prediction(as.numeric(pred1), as.numeric(completedData$Restate_Int))
+auc_out1 <- performance(ROCpred_out1, 'auc')
+auc_out1@y.values[[1]]
+
+
+```
+
+The p-value of all the coefficents are less than 0.05.However,the AUC is still low at 0.5871462
+
+```{r exercise3, eval=TRUE, message=FALSE}
+
+# Performance of logistic model on test set
+
+log_test <- predict(fit1, testingfull, type = 'response')
+log_test <- data_frame('gvkey' = testingfull$gvkey, "Restate_Int" = log_test)
+write.csv(log_test,"log_test.csv")
+
+```
+
+On the testing dataset, 
+
+# Variable Selection
+
+```{r exercise4, eval=TRUE}
+
+# Stepwise regression on the logistic model
+
+library(MASS)
+
+# Stepwise regression model
+fit2 <- stepAIC(fit1, direction = "both", 
+                      trace = FALSE)
+summary(fit2)
+
+fit2$anova
+
+# AUC 
+
+pred2 <- predict(fit2, completedData, type="response") 
+ROCpred_out2 <- prediction(as.numeric(pred2), as.numeric(completedData$Restate_Int))
+auc_out2 <- performance(ROCpred_out2, 'auc')
+auc_out2@y.values[[1]]
+
+```
+
+Final Model:
+Restate_Int ~ act + ch + dcpstk + ebit + ivst + lct + ppegt + 
+    re + c_ratio + soft_assets + inventory_ch
+
+```{r exercise3, eval=TRUE, message=FALSE}
+
+# Performance of stepwised regression model on test set
+
+stepwise_test <- predict(fit2, testingfull, type = 'response')
+stepwise_test <- data_frame('gvkey' = testingfull$gvkey, "Restate_Int" = stepwise_test)
+write.csv(stepwise_test,"stepwise_test.csv")
+
+```
+
+
+
+```{r exercise5, eval=TRUE}
+
+# Lasso
+
+# Equation for the regression.  -1 removes the intercept
+
+x <- model.matrix(eq, data=completedData)
+y <- model.frame(eq, data=completedData)[,"Restate_Int"]
+
+set.seed(466846)
+fit3 <- cv.glmnet(y = y,
+                  x = x,
+                  family = "binomial",
+                  alpha = 1,
+                  type.measure = "auc")
+plot(fit3)
+
+#ouput coefficient table for LASSO
+coef(fit3, s="lambda.min" )
+
+#coefficient plot
+coefplot(fit3, lambda='lambda.min', sort='magnitude')
+
+# Make predictions using testing data
+pred3 <- predict(fit3, x, type="response", s = "lambda.min")
+
+# Use ROCR to calculate ROC curve
+ROCpred_out3 <- prediction(as.numeric(pred3), as.numeric(y))
+ROCperf_out3 <- performance(ROCpred_out3, 'tpr','fpr')
+
+# Make data frame to pas to ggplot2
+df_ROC_out_CV3 <- data.frame(FalsePositive=c(ROCperf_out3@x.values[[1]]),
+                 TruePositive=c(ROCperf_out3@y.values[[1]]))
+
+# Graph ROC curve
+ggplot() +
+  geom_line(data=df_ROC_out_CV3, aes(x=FalsePositive,
+                                    y=TruePositive,
+                                    color="LASSO")) +
+  geom_abline(slope=1) + ggtitle("ROC Curve")
+
+# Calculate ROC AUC
+auc_out3 <- performance(ROCpred_out3, measure = "auc")
+auc_out3@y.values[[1]]
+
+
+```
+
+Lasso and stepwise regression model indicated common IVs like dcpstk, ebit, ivst, lct, ppegt,re,c_raio, soft_assets, and inventory_ch
+
+```{r exercise3, eval=TRUE, message=FALSE}
+
+# Performance of lasso model on test set
+
+xtesting_lasso <- testingfull[c(3:6,8:13,16:38)]
+
+lasso_test <- predict(fit3, as.matrix(xtesting_lasso), type = 'response', s = "lambda.min")
+lasso_test <- data_frame('gvkey' = testingfull$gvkey, "Restate_Int" = lasso_test)
+write.csv(lasso_test,"lasso_test.csv")
+
+```
+
+
+```{r exercise5, eval=TRUE}
+
+#ouput coefficient table for LASSO 1 SE
+
+coef(fit3, s="lambda.1se" )
+
+#coefficient plot
+coefplot(fit3, lambda='lambda.1se', sort='magnitude')
+
+# Make predictions using testing data
+pred3_1se <- predict(fit3, x, type="response", s = "lambda.1se")
+
+# Use ROCR to calculate ROC curve
+ROCpred_out3_1se <- prediction(as.numeric(pred3_1se), as.numeric(y))
+ROCperf_out3_1se <- performance(ROCpred_out3_1se, 'tpr','fpr')
+
+# Make data frame to pas to ggplot2
+df_ROC_out_CV3_1se <- data.frame(FalsePositive=c(ROCperf_out3_1se@x.values[[1]]),
+                 TruePositive=c(ROCperf_out3_1se@y.values[[1]]))
+
+# Graph ROC curve
+ggplot() +
+  geom_line(data=df_ROC_out_CV3_1se, aes(x=FalsePositive,
+                                    y=TruePositive,
+                                    color="LASSO")) +
+  geom_abline(slope=1) + ggtitle("ROC Curve")
+
+# Calculate ROC AUC
+auc_out3_1se <- performance(ROCpred_out3_1se, measure = "auc")
+auc_out3_1se@y.values[[1]]
+
+
+```
+
+
+
+```{r exercise3, eval=TRUE, message=FALSE}
+
+# Performance of lasso model on test set
+
+xtesting_lasso <- testingfull[c(3:6,8:13,16:38)]
+
+lasso1se_test <- predict(fit3, as.matrix(xtesting_lasso), type = 'response', s = "lambda.1se")
+lasso1se_test <- data_frame('gvkey' = testingfull$gvkey, "Restate_Int" = lasso_test)
+write.csv(lasso1se_test,"lasso1se_test.csv")
+
+```
+
+
+
+```{r exercise6, eval=TRUE}
+
+# k-means clustering + logistic regression model
+
+# Drawing a tsne graph of the data by gsector
+
+library(Rtsne)
+
+clustertraining <- na.omit(completedData)
+
+tsne_data <- Rtsne(clustertraining)
+
+clustertraining1 <- clustertraining %>%
+  mutate(tsne1 = tsne_data$Y[, 1], tsne2 = tsne_data$Y[, 2])
+
+library(ggplot2)
+ggplot(clustertraining1, aes(x = tsne1, y = tsne2, colour = factor(gsector))) + 
+    geom_point(alpha = 0.3) + theme_bw()
+
+```
+
+
+```{r exercise6, eval=TRUE}
+
+# k-means clustering
+
+library(cluster)
+
+# Elbow Method
+
+set.seed(123)
+
+k.max <- 15
+wss <- sapply(1:k.max, 
+              function(k){kmeans(clustertraining[-c(1,2,3,8,15,16)], k, nstart=50,iter.max = 15 )$tot.withinss})
+
+plot(1:k.max, wss,
+     type="b", pch = 19, frame = FALSE, 
+     xlab="Number of clusters K",
+     ylab="Total within-clusters sum of squares")
+
+
+```
+
+
+Elbow plot did not indicate any peak. 11 has been chosen as the number of clusters, equal to the number of gsectors.
+
+```{r exercise7, eval=TRUE}
+
+# k-means 
+
+fit4 = kmeans(clustertraining[-c(1,2,3,8,15,16)],4,nstart = 50,iter.max = 15) 
+
+# we keep number of iter.max=15 to ensure the algorithm converges and nstart=50 to 
+# ensure that atleat 50 random sets are choosen  
+
+fit4$centers
+fit4$withinss
+fit4$size
+
+# Assigning each data to its respective cluster
+
+dfcluster = cbind(clustertraining, as.data.frame(fit4$cluster))
+colnames(dfcluster)[colnames(dfcluster)=="fit4$cluster"] <- "cluster"
+
+
+# cluster plot by clusters
+
+ggplot(clustertraining1, aes(x = tsne1, y = tsne2, colour = factor(dfcluster$cluster))) + 
+    geom_point(alpha = 0.3) + theme_bw()
+
+
+```
+
+Should we include columns 1,2,3,8,15,16 of the completedData to our knn?
+
+
+Comparing the tsne graph with gsector and the tsne graph with clusters indicated that there are similarities present among the companies that are grouped together by their gsector.
+
+```{r exercise9, eval=TRUE}
+
+# seperating the data to clusters
+
+fit5 <- glm(Restate_Int ~ (act + at + ch + chech + dclo + dcpstk + dlc + dltt + ebit + 
+                emp + invch + ivch + ivst + lct + mkvalt + ni + oancf + ppegt + re + recch + 
+                revt + sale + seq + txp + xint + c_ratio + soft_assets + M2B + inventory_ch + receivables_ch 
+                + roa + earnings_to_price + cash_profit_margin -1):factor(cluster), data = dfcluster,
+            family = "binomial")
+
+
+# Output of the summary model
+summary(fit5)
+
+# AUC
+pred5 <- predict(fit5, dfcluster, type="response") 
+ROCpred_out5 <- prediction(as.numeric(pred5), as.numeric(dfcluster$Restate_Int))
+auc_out5 <- performance(ROCpred_out5, 'auc')
+auc_out5@y.values[[1]]
+
+```
+
+
+```{r exercise3, eval=TRUE, message=FALSE}
+
+# Performing clustering + logistic regression model on test set
+
+# k-means 
+clustertesting <- na.omit(testingfull)
+
+colnames(clustertesting)[colSums(is.na(clustertesting)) > 0]
+
+fit4test = kmeans(clustertesting,4,nstart = 50,iter.max = 15) 
+
+#we keep number of iter.max=15 to ensure the algorithm converges and nstart=50 to #ensure that atleat 50 random sets are choosen  
+
+fit4test$centers
+fit4test$withinss
+fit4test$size
+
+# Assigning each data to its respective cluster
+
+dfclustertesting = cbind(clustertesting, as.data.frame(fit4test$cluster))
+colnames(dfclustertesting)[colnames(dfclustertesting)=="fit4test$cluster"] <- "cluster"
+
+# Making test set
+
+cluslogit_test <- predict(fit5, dfclustertesting, type = 'response')
+cluslogit_test <- data_frame('gvkey' = clustertesting$gvkey, "Restate_Int" = cluslogit_test)
+write.csv(cluslogit_test,"cluslogit_test.csv")
+
+```
+
+To run clustering + logistic regression model requires us to omit missing data present in the testing data, although there were no missing data present. 
+
+# XGBoost
+
+```{r exercise10, eval=TRUE}
+
+# Model setup
+library(xgboost)
+library(devtools)
+
+set.seed(786354)
+# These params take some work to pin down
+params <- list(max_depth=5,
+               eta=0.2,
+               gamma=10,
+               min_child_weight = 20,
+               objective = "binary:logistic")
+
+xgbCV <- xgb.cv(params=params,
+                data=x,
+                label=y,
+                nrounds=100,
+                eval_metric="auc",
+                nfold=10,
+                stratified=TRUE)
+
+numTrees <- min(which(xgbCV$evaluation_log$test_auc_mean == 
+                      max(xgbCV$evaluation_log$test_auc_mean)))
+
+fit6 <- xgboost(params=params,
+                data = x,
+                label = y,
+                nrounds = numTrees,
+                eval_metric="auc")
+
+# Display relative importance of variables for prediction
+xgb.data = xgb.DMatrix(x, label = y, missing = NA)
+col_names = attr(xgb.data, ".Dimnames")[[2]]
+imp = xgb.importance(col_names, fit6)
+print("Model Importance")
+xgb.plot.importance(imp)
+
+# Usual AUC calculation
+pred.xgb <- predict(fit6, x, type="response")
+ROCpred.xgb <- prediction(as.numeric(pred.xgb), as.numeric(y))
+ROCperf.xgb <- performance(ROCpred.xgb, 'tpr','fpr')
+#plot(ROCperf.xgb)
+df_ROC.xgb <- data.frame(FalsePositive=c(ROCperf.xgb@x.values[[1]]),
+                 TruePositive=c(ROCperf.xgb@y.values[[1]]))
+
+auc.xgb <- performance(ROCpred.xgb, measure = "auc")
+auc6 <- auc.xgb@y.values[[1]]
+names(auc6) <- c("XGBoost AUC")
+auc6
+
+```
+
+https://towardsdatascience.com/xgboost-is-not-black-magic-56ca013144b4
+
+One of the coolest characteristics of XGBoost is how it deals with missing values: deciding for each sample which is the best way to impute them. 
+
+
+```{r exercise3, eval=TRUE, message=FALSE}
+
+# Performing xgboost model on test set
+
+# Making test set
+xtesting_xgb = testingfull[c(3:6,8:13,16:35)]
+xtesting_xgb <- cbind("(Intercept)"=1,xtesting_xgb)
+
+xgb_test <- predict(fit6, as.matrix(xtesting_xgb), type = 'response')
+xgb_test <- data_frame('gvkey' = testingfull$gvkey, "Restate_Int" = xgb_test)
+write.csv(xgb_test,"xgb_test.csv")
+
+```
+
+# KNN
+
+```{r knn, echo=FALSE}
+library(caret)
+library(e1071)
+trControl <- trainControl(method ='cv', number=20)
+fit7 <- train(as.factor(Restate_Int) ~. ,
+              method = 'knn',
+              tuneGrid = expand.grid(k=1:20),
+              trControl = trControl,
+              metric = "Accuracy",
+              data = completedData[-c(1,2,8,15,16)])
+
+# AUC
+pred7 <- as.data.frame(predict(fit7, completedData[-c(1,2,8,15,16)], type="prob"))
+summary(pred7)
+ROCpred_out7 <- prediction(as.numeric(pred7[,2]), as.numeric(completedData$Restate_Int))
+table(as.numeric(completedData$Restate_Int), pred7[,2] > 0.5)
+auc_out7 <- performance(ROCpred_out7, 'tpr', "fpr")
+plot(auc_out7)
+auc_out7@y.values[[1]]
+
+df_ROC_out_CV7 <- data.frame(FalsePositive=c(auc_out7@x.values[[1]]),
+                 TruePositive=c(auc_out7@y.values[[1]]))
+ggplot() +
+  geom_line(data=df_ROC_out_CV7, aes(x=FalsePositive,
+                                    y=TruePositive,
+                                    color="KNN")) +
+  geom_abline(slope=1) + ggtitle("ROC Curve for KNN")
+
+```
+
+
+
+```{r exercise3, eval=TRUE, message=FALSE}
+
+# Performing knn model on test set
+
+# Making test set
+
+knn_test <- predict(fit7, testingfull, type = 'prob')
+knn_test <- knn_test[2] # selecting the 2nd column of probability
+colnames(knn_test)[1] <- "Restate_Int"
+knn_test <- cbind(testingfull$gvkey, knn_test)
+colnames(knn_test)[1] <- "gvkey"
+write.csv(knn_test,"knn_test.csv")
+
+```
+
+
+
+# Random forest
+
+```{r knn, echo=FALSE}
+library(randomForest)
+library(missForest)
+library(caret)
+
+set.seed(1)
+# Oversampling Completed Data Using the SMOTE oversampling method.
+
+library(DMwR)
+completedData$Restate_Int <- as.factor(completedData$Restate_Int)
+ 
+completedData2 <- DMwR::SMOTE(Restate_Int ~ act + at + ch + chech + dclo + dcpstk + dlc + dltt + ebit + 
+                emp + invch + ivch + ivst + lct + mkvalt + ni + oancf + ppegt + re + recch + 
+                revt + sale + seq + txp + xint + c_ratio + soft_assets + M2B + inventory_ch + receivables_ch + 
+                roa + earnings_to_price + cash_profit_margin, completedData, k = 5, perc.over=300, perc.under = 100)
+summary(completedData2$Restate_Int)
+completedData <- rbind(completedData, completedData2) # new oversampled data
+
+#exporting into RDS file
+saveRDS(completedData, file = "completedData1.rds")
+
+
+# Attempting oversampling for RandomForest
+fit8 <- randomForest(Restate_Int ~ act + at + ch + chech + dclo + dcpstk + dlc + dltt + ebit + 
+                emp + invch + ivch + ivst + lct + mkvalt + ni + oancf + ppegt + re + recch + 
+                revt + sale + seq + txp + xint + c_ratio + soft_assets + M2B + inventory_ch + receivables_ch + 
+                roa + earnings_to_price + cash_profit_margin, data = completedData[-c(1,2,8,15,16)], ntrees=100, 
+                             mtry=2, nodesize=5, importance=TRUE)
+
+
+# AUC
+pred8 <- predict(fit8, completedData[-c(1,2,8,15,16)], type = "prob" ) 
+ROCpred_out8 <- prediction(as.numeric(pred8[,2]), as.numeric(completedData$Restate_Int))
+auc_out8 <- performance(ROCpred_out8, 'auc')
+auc_out8@y.values[[1]]
+
+```
+
+
+```{r export eval=TRUE, message=FALSE}
+
+# Performing random forest model on test set
+
+# Making test set
+
+rf_test <- predict(fit8, testingfull, type = 'prob')
+rf_test <- data_frame('gvkey' = testingfull$gvkey, "Restate_Int" = rf_test)
+write.csv(rf_test,"rf_test.csv")
+
+```
+
+
