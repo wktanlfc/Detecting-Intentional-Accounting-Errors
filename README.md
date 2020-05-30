@@ -2,7 +2,7 @@
  
 
 
-This competition required us to predict misstatements in companies annual financial report filings over the course of 4 years, from 2005-2009.
+This competition required us to predict misstatements in companies' annual financial report filings over the course of 4 years, from 2005-2009.
 
 In addition, a dataset of sentiments was used (8 million~ rows) and readability index were used to increase prediction accuracy.
 
