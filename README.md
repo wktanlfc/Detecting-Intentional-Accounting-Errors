@@ -8,7 +8,7 @@ In addition, a dataset of sentiments was used (8 million~ rows) and readability 
 
 Our model performed reasonably well, at 72% ROC on the leaderboard.
 
-Special thanks to my groupmates Dominic, Charlotte, Jun Rong, Ada, and Professor Richard Crowley, for this great opportunity.
+Special thanks to my groupmates Dominic, Charlotte, Jun Rong, Ada, and Professor Richard Crowley, for this great experience.
 
 Data is kept confidential due to its sensitive nature.
 
